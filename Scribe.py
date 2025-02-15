@@ -60,7 +60,8 @@ if not user_info or not user_info.is_logged_in:
     """)
     
     # Login section using single column
-    google_button = st.button("Google Login")
+    password = st.text_input("Enter App Password", type="password")
+    google_button = st.button("Google Login", disabled=not password or password != st.secrets["password"]["app_password"])
 
     if google_button:
         st.login(provider="google")
