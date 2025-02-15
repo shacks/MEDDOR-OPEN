@@ -21,8 +21,8 @@ def create_checkout_session(user_email):
                 'quantity': 1,
             }],
             mode='payment',
-            success_url=st.secrets["BASE_URL"] + "/Payments_%26_Settings?success=true",
-            cancel_url=st.secrets["BASE_URL"] + "/Payments_%26_Settings?canceled=true",
+            success_url=st.secrets["BASE_URL"] + "/Payments_&_Settings?success=true",
+            cancel_url=st.secrets["BASE_URL"] + "/Payments_&_Settings?canceled=true",
             customer_email=user_email,
             metadata={'user_email': user_email}
         )
