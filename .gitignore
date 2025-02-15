@@ -1,0 +1,17 @@
+.streamlit
+.venv
+keys.env
+secret_config.py
+venv/
+__pycache__
+myenv
+.streamlit/secrets.toml
+package.json
+package-lock.json
+dist
+build
+poetry.lock
+pyproject.toml
+Scribe.spec
+
+

@@ -1,0 +1,370 @@
+import streamlit as st
+from st_supabase_connection import SupabaseConnection
+from datetime import datetime
+import whisper
+import tempfile
+import os
+import numpy as np
+import io
+import shutil
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Add ffmpeg check function
+def check_ffmpeg():
+    """Check if ffmpeg is installed on the server"""
+    try:
+        ffmpeg_path = shutil.which('ffmpeg')
+        if not ffmpeg_path:
+            logger.error("FFmpeg not found in system PATH")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Error checking FFmpeg: {str(e)}")
+        return False
+
+# Initialize Supabase connection
+conn = st.connection("supabase", type=SupabaseConnection)
+
+# Whisper model options
+WHISPER_MODELS = {
+    "Tiny (fastest, 1GB VRAM)": "tiny",
+    "Base (1GB VRAM)": "base",
+    "Small (2GB VRAM)": "small",
+    "Medium (5GB VRAM)": "medium",
+    "Large (10GB VRAM)": "large",
+    "Turbo (6GB VRAM, fast)": "turbo"
+}
+
+@st.cache_resource
+def load_whisper_model(model_size):
+    """Load Whisper model - cached to avoid reloading"""
+    return whisper.load_model(model_size)
+
+def process_audio(audio_file, model_size="base"):
+    """Process audio using Whisper with proper preprocessing"""
+    try:
+        # Read bytes from UploadedFile
+        if hasattr(audio_file, 'read'):
+            # If it's a file-like object (UploadedFile)
+            audio_bytes = audio_file.read()
+        else:
+            # If it's already bytes
+            audio_bytes = audio_file
+            
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_audio:
+            temp_audio.write(audio_bytes)
+            temp_audio_path = temp_audio.name
+
+            # Load model
+            model = load_whisper_model(model_size)
+            
+            # Load and preprocess audio
+            audio = whisper.load_audio(temp_audio_path)
+            audio = whisper.pad_or_trim(audio)
+            
+            # Create mel spectrogram
+            mel = whisper.log_mel_spectrogram(audio).to(model.device)
+            
+            # Detect language
+            _, probs = model.detect_language(mel)
+            detected_lang = max(probs, key=probs.get)
+            
+            # Transcribe with detected language
+            result = model.transcribe(
+                temp_audio_path,
+                language=detected_lang,
+                verbose=False
+            )
+            
+            # Clean up
+            os.unlink(temp_audio_path)
+            
+            return {
+                "text": result["text"].strip(),
+                "language": detected_lang,
+                "segments": result.get("segments", []),
+                "language_probs": probs
+            }
+            
+    except Exception as e:
+        st.error(f"Transcription error: {str(e)}")
+        return None
+
+def upload_to_storage(audio_file, title=""):
+    """Upload recording to Supabase storage only"""
+    try:
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"recording_{timestamp}.wav"
+        if title:
+            safe_title = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).strip()
+            file_name = f"{safe_title}_{timestamp}.wav"
+        
+        storage_path = "recordings/" + file_name
+
+        # Upload to Supabase storage
+        upload_response = conn.upload(
+            "audio_recordings",
+            "local",
+            audio_file,
+            storage_path,
+            "false"
+        )
+        logger.info("Storage upload successful")
+        return True, file_name, storage_path
+            
+    except Exception as e:
+        logger.error(f"Upload failed: {str(e)}")
+        st.error(f"Error uploading file: {str(e)}")
+        return False, None, None
+
+def save_recording(file_name, storage_path, title="", transcript=""):
+    """Save recording metadata to database"""
+    try:
+        # Create transaction data structure similar to Camera_Upload.py
+        recording_data = {
+            "file_name": str(file_name),
+            "title": str(title) if title else "",
+            "transcript": str(transcript) if transcript else "",
+            "created_at": datetime.now().isoformat(),
+            "file_path": str(storage_path)
+        }
+        
+        logger.info(f"Attempting to save recording: {recording_data}")
+        
+        # Use direct table insert like Camera_Upload.py
+        response = conn.table("personal_recordings").insert(recording_data).execute()
+        
+        if response and response.data:
+            logger.info(f"Successfully saved recording: {response.data}")
+            return True
+        else:
+            logger.error("No data returned from insert")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Database save failed: {str(e)}")
+        st.error(f"Error saving recording: {str(e)}")
+        return False
+
+def delete_recording(record_id):
+    """Delete a recording"""
+    try:
+        conn.table("personal_recordings").delete().eq("id", record_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error deleting recording: {str(e)}")
+        return False
+
+def download_audio(file_path):
+    """Download audio file from Supabase storage"""
+    try:
+        logger.info(f"Attempting to download: {file_path}")
+        
+        # Fixed: Pass storage path as positional argument after table name
+        file_name, mime, file_data = conn.download(
+            "audio_recordings",
+            file_path
+        )
+        
+        if file_data:
+            logger.info("File downloaded successfully")
+            return file_name, mime, file_data
+        else:
+            logger.error("No data returned from storage")
+            return None, None, None
+            
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        return None, None, None
+
+def show():
+    # Initialize session states
+    if 'save_status' not in st.session_state:
+        st.session_state.save_status = None
+    if 'transcription_result' not in st.session_state:
+        st.session_state.transcription_result = None
+
+    st.title("🎙️ Personal Voice Recorder")  # Added emoji
+    
+    # Server-side check for ffmpeg
+    if not check_ffmpeg():
+        st.error("⚠️ Server Configuration Error: FFmpeg is not installed on the server")
+        st.info("Please contact the administrator to install FFmpeg on the server.")
+        return
+        
+    tab1, tab2 = st.tabs(["Record", "View Recordings"])
+    
+    with tab1:
+        st.subheader("📝 New Recording")  # Added emoji
+        
+        # Improved layout with better spacing
+        with st.container():
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                title = st.text_input("📋 Recording Title (optional)")  # Added emoji
+            with col2:
+                model_size = st.selectbox(
+                    "🤖 Model",  # Added emoji and shortened label
+                    options=list(WHISPER_MODELS.keys()),
+                    help="Larger models are more accurate but require more VRAM"
+                )
+        
+        # Add some spacing
+        st.write("")
+        
+        # Make recording button more prominent
+        st.markdown("### 🎤 Record")  # Added emoji heading
+        st.session_state["audio"] = st.audio_input("Click to start recording", key="audio_recorder")
+        
+        if st.session_state["audio"]:
+            # Add a nice container for the audio player
+            with st.container():
+                st.audio(st.session_state["audio"], format="audio/wav")
+            
+            success, file_name, storage_path = upload_to_storage(
+                st.session_state["audio"],
+                title
+            )
+            
+            if success:
+                st.success("🎵 Audio uploaded successfully!")
+                
+                st.session_state['current_file'] = {
+                    'file_name': file_name,
+                    'storage_path': storage_path
+                }
+                
+                # Improved button layout with better styling
+                with st.container():
+                    process_col1, process_col2, process_col3 = st.columns([1, 1, 1])
+                    
+                    with process_col1:
+                        if st.button("🎯 Process", use_container_width=True):
+                            with st.spinner("🔄 Processing..."):
+                                result = process_audio(
+                                    st.session_state["audio"], 
+                                    WHISPER_MODELS[model_size]
+                                )
+                                if result:
+                                    st.session_state.transcription_result = result
+                    
+                    with process_col2:
+                        if st.button(
+                            "💾 Save",
+                            type="primary",
+                            disabled=not st.session_state.get('transcription_result'),
+                            use_container_width=True
+                        ):
+                            current_file = st.session_state.get('current_file', {})
+                            if not current_file:
+                                st.error("❌ No file data found")
+                            else:
+                                save_success = save_recording(
+                                    current_file.get('file_name'),
+                                    current_file.get('storage_path'),
+                                    title,
+                                    st.session_state.transcription_result["text"]
+                                )
+                                if save_success:
+                                    st.success("✅ Recording saved!")
+                                else:
+                                    st.error("❌ Failed to save recording")
+                
+                # Display results in a nice container
+                if st.session_state.transcription_result:
+                    result = st.session_state.transcription_result
+                    
+                    with st.container():
+                        st.markdown("---")  # Add separator
+                        st.markdown("### 📊 Results")  # Added emoji
+                        
+                        # Language info in a neat format
+                        lang_col1, lang_col2 = st.columns([1, 2])
+                        with lang_col1:
+                            st.success(f"🌍 Language: {result['language'].upper()}")
+                        
+                        with lang_col2:
+                            # Format probabilities as progress bars
+                            st.write("Confidence Scores:")
+                            for lang, prob in sorted(
+                                result['language_probs'].items(),
+                                key=lambda x: x[1],
+                                reverse=True
+                            )[:3]:
+                                st.progress(prob, text=f"{lang}: {prob:.1%}")
+                        
+                        # Transcript in a nice container
+                        st.markdown("### 📝 Transcript")
+                        st.text_area(
+                            "",  # Empty label for cleaner look
+                            value=result["text"],
+                            height=150,
+                            key="transcript"
+                        )
+                        
+                        # Collapsible segments
+                        if result["segments"]:
+                            with st.expander("🕒 View Segments"):
+                                for seg in result["segments"]:
+                                    st.markdown(
+                                        f"**{seg['start']:.1f}s - {seg['end']:.1f}s**\n{seg['text']}"
+                                    )
+    
+    with tab2:
+        st.subheader("📚 Saved Recordings")  # Added emoji
+        
+        try:
+            # Fetch recordings from database
+            response = conn.table("personal_recordings").select("*").order('created_at', desc=True).execute()
+            
+            if response.data:
+                for record in response.data:
+                    with st.expander(
+                        f"{record['created_at'][:16]} - {record['title'] or record['file_name']}"
+                    ):
+                        # Display transcript if available
+                        if record.get('transcript'):
+                            st.text_area(
+                                "Transcript",
+                                record['transcript'],
+                                height=100,
+                                key=f"transcript_{record['id']}"
+                            )
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            # Updated download button handling
+                            if st.button("⬇️ Download", key=f"download_{record['id']}", use_container_width=True):
+                                with st.spinner("Downloading..."):
+                                    file_name, mime, data = download_audio(record['file_path'])
+                                    if data:
+                                        st.download_button(
+                                            "📥 Save File",
+                                            data=data,
+                                            file_name=file_name,
+                                            mime=mime,
+                                            key=f"save_{record['id']}",
+                                            use_container_width=True
+                                        )
+                                    else:
+                                        st.error("Failed to download audio file")
+                        
+                        with col2:
+                            # Updated delete button
+                            if st.button("🗑️ Delete", key=f"delete_{record['id']}", use_container_width=True):
+                                if delete_recording(record['id']):
+                                    st.success("Recording deleted!")
+                                    st.rerun()
+            else:
+                st.info("No recordings found")
+                
+        except Exception as e:
+            st.error(f"Error loading recordings: {str(e)}")
+
+if __name__ == "__main__":
+    show()
