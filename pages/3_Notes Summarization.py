@@ -1,8 +1,6 @@
 import streamlit as st
 from st_supabase_connection import SupabaseConnection
 from components.generate_summary import generate_summary, generate_summary_claude
-from Archive.cost_calculator import calculate_cost
-from Archive.password_protection import check_password
 import datetime
 from st_copy_to_clipboard import st_copy_to_clipboard
 import time
@@ -48,7 +46,7 @@ else:
         st.session_state.ai_output_text = ai_output_text
         st.session_state.input_tokens = input_tokens
         st.session_state.output_tokens = output_tokens
-        st.session_state.costs = calculate_cost(input_tokens, output_tokens)
+        
 
     # 4. Show the summary output and cost (if we have any)
     if st.session_state.ai_output_text:
